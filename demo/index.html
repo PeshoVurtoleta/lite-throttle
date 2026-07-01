@@ -1,0 +1,694 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>@zakkster/lite-throttle — three-channel scope</title>
+
+    <!--
+        Single-page interactive demo for QA + product review.
+
+        Renders three live channels driven by ONE noise source:
+          - RAW: every source.set() (the unthrottled firehose)
+          - throttle(ms): leading + trailing time-based, ms slider-controlled
+          - throttleRAF: leading + trailing aligned to the host's animation frame
+
+        Each channel has its own oscilloscope strip showing emissions over
+        time, plus a live counter and a "write reduction" percentage so you
+        can see the coalescing effect numerically.
+
+        Edge selection (leading / trailing) toggled live; both throttle and
+        throttleRAF react immediately (the underlying instances are torn down
+        and rebuilt on edge change).
+
+        Three noise sources: pointer in the pad, slider drag, and "BURST"
+        button for 1000 sync writes (use this to demo the leading+pending
+        contract; you'll see ONE leading + ONE trailing per channel).
+
+        Runs the published API directly via the import map -- no build step.
+    -->
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+
+    <script type="importmap">
+{
+  "imports": {
+    "@zakkster/lite-signal": "https://esm.sh/@zakkster/lite-signal@1.1.5"
+  }
+}
+    </script>
+
+    <style>
+        :root {
+            --bg: #070b0c;
+            --panel: #0d1416;
+            --panel-2: #0a1011;
+            --grid: #13211f;
+            --line: #1c2c2a;
+            --raw: #ff5a55;            /* RAW firehose — danger red */
+            --raw-dim: #5e1b18;
+            --thr: #34f5a3;            /* throttle — phosphor green */
+            --thr-dim: #1a7d56;
+            --raf: #ffc24d;            /* throttleRAF — amber */
+            --raf-dim: #8a6a1f;
+            --ink: #cfe9e1;
+            --muted: #6f8a83;
+            --faint: #3c534e;
+            --mono: 'JetBrains Mono', ui-monospace, monospace;
+            --disp: 'Chakra Petch', var(--mono);
+        }
+        * { box-sizing: border-box }
+        html, body { margin: 0 }
+        body {
+            background:
+                radial-gradient(1200px 500px at 80% -10%, #0f1c1b 0%, transparent 60%),
+                radial-gradient(900px 600px at -10% 110%, #10201d 0%, transparent 55%),
+                var(--bg);
+            color: var(--ink);
+            font-family: var(--mono);
+            line-height: 1.5;
+            min-height: 100vh;
+            padding: 32px 20px 64px;
+            background-attachment: fixed;
+        }
+        body::before {
+            content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 999;
+            background: repeating-linear-gradient(0deg, rgba(255,255,255,.012) 0 1px, transparent 1px 3px);
+            mix-blend-mode: overlay;
+        }
+        .wrap { max-width: 1080px; margin: 0 auto; }
+        header { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-bottom: 4px; }
+        h1 {
+            font-family: var(--disp); font-weight: 600; font-size: 26px; margin: 0;
+            letter-spacing: .02em;
+        }
+        h1 .at { color: var(--thr); }
+        .chips { display: flex; gap: 6px; }
+        .chip {
+            padding: 2px 8px; border-radius: 4px;
+            border: 1px solid var(--line); color: var(--muted);
+            font-size: 11px; font-family: var(--mono);
+        }
+        .chip b { color: var(--ink); font-weight: 600; }
+        .sub { color: var(--muted); font-size: 13px; margin: 8px 0 22px; }
+        h2 {
+            font-family: var(--disp); font-weight: 600; font-size: 15px;
+            margin: 0 0 12px; letter-spacing: .04em; text-transform: uppercase;
+            color: var(--ink);
+        }
+
+        .card {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            padding: 18px;
+        }
+
+        /* ── Noise source panel ─────────────────────────────────────────── */
+        .noise {
+            display: grid;
+            grid-template-columns: 1.4fr 1fr;
+            gap: 16px;
+            margin-bottom: 18px;
+        }
+        @media (max-width: 800px) { .noise { grid-template-columns: 1fr; } }
+        .pad {
+            position: relative;
+            background: var(--panel-2);
+            border: 1px dashed var(--line);
+            border-radius: 8px;
+            height: 200px;
+            cursor: crosshair;
+            overflow: hidden;
+        }
+        .pad::before {
+            content: "MOVE POINTER HERE";
+            position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+            color: var(--faint); font-family: var(--disp); font-size: 12px; letter-spacing: .15em;
+            pointer-events: none;
+        }
+        .pad.active::before { content: ""; }
+        .pad-dot {
+            position: absolute; width: 8px; height: 8px; border-radius: 50%;
+            background: var(--raw); box-shadow: 0 0 12px var(--raw);
+            transform: translate(-50%, -50%);
+            transition: opacity .2s;
+            pointer-events: none;
+        }
+        .pad-readout {
+            position: absolute; bottom: 8px; right: 10px;
+            color: var(--muted); font-size: 11px;
+            font-family: var(--mono); font-variant-numeric: tabular-nums;
+        }
+        .controls .row {
+            display: flex; align-items: center; justify-content: space-between;
+            margin: 8px 0; gap: 12px;
+        }
+        .controls .lbl { color: var(--muted); font-size: 12.5px; }
+        .controls input[type="range"] {
+            flex: 1; max-width: 220px; accent-color: var(--thr);
+        }
+        .controls .val {
+            min-width: 56px; text-align: right;
+            font-family: var(--mono); font-variant-numeric: tabular-nums;
+            color: var(--ink); font-size: 12px;
+        }
+        .toggle { position: relative; display: inline-block; width: 36px; height: 18px; }
+        .toggle input { opacity: 0; width: 0; height: 0; }
+        .toggle .track {
+            position: absolute; cursor: pointer; inset: 0;
+            background: var(--line); border-radius: 18px; transition: .15s;
+        }
+        .toggle .knob {
+            position: absolute; height: 14px; width: 14px; top: 2px; left: 2px;
+            background: var(--muted); border-radius: 50%; transition: .15s;
+            pointer-events: none;
+        }
+        .toggle input:checked + .track { background: var(--thr-dim); }
+        .toggle input:checked + .track + .knob { left: 20px; background: var(--thr); }
+        .btn {
+            font-family: var(--disp); font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
+            padding: 8px 14px;
+            background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+            border-radius: 6px; cursor: pointer; transition: .12s;
+        }
+        .btn:hover { border-color: var(--thr-dim); color: var(--thr); }
+        .btn.burst { border-color: var(--raw-dim); color: var(--raw); }
+        .btn.burst:hover { background: rgba(255,90,85,.06); }
+
+        /* ── Three-channel scope ────────────────────────────────────────── */
+        .channels {
+            display: grid; grid-template-columns: 1fr; gap: 12px; margin-bottom: 18px;
+        }
+        .channel {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            padding: 14px 16px;
+            display: grid;
+            grid-template-columns: 140px 1fr 200px;
+            gap: 14px;
+            align-items: center;
+        }
+        @media (max-width: 800px) {
+            .channel { grid-template-columns: 1fr; }
+        }
+        .ch-label {
+            display: flex; flex-direction: column; gap: 4px;
+        }
+        .ch-label .name {
+            font-family: var(--disp); font-weight: 600; font-size: 14px;
+            display: flex; align-items: center; gap: 8px;
+        }
+        .ch-label .name .dot {
+            width: 10px; height: 10px; border-radius: 50%;
+            box-shadow: 0 0 8px currentColor;
+        }
+        .ch-label .desc {
+            font-size: 11px; color: var(--faint); font-family: var(--mono);
+        }
+        .ch-canvas {
+            width: 100%;
+            height: 64px;
+            background: var(--panel-2);
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            display: block;
+        }
+        .ch-meters {
+            display: flex; gap: 14px; justify-content: flex-end;
+            font-family: var(--mono); font-variant-numeric: tabular-nums;
+        }
+        .ch-meter {
+            text-align: right;
+        }
+        .ch-meter .n { font-size: 18px; font-weight: 700; }
+        .ch-meter .t {
+            font-size: 9.5px; letter-spacing: .08em; text-transform: uppercase;
+            color: var(--faint); margin-top: 2px;
+            font-family: var(--disp);
+        }
+        .channel.raw .name .dot { background: var(--raw); color: var(--raw); }
+        .channel.thr .name .dot { background: var(--thr); color: var(--thr); }
+        .channel.raf .name .dot { background: var(--raf); color: var(--raf); }
+        .channel.raw .ch-meter .n { color: var(--raw); }
+        .channel.thr .ch-meter .n { color: var(--thr); }
+        .channel.raf .ch-meter .n { color: var(--raf); }
+
+        /* ── Stats panel ────────────────────────────────────────────────── */
+        .stats {
+            display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 18px 0;
+        }
+        @media (max-width: 800px) { .stats { grid-template-columns: 1fr 1fr; } }
+        .stat {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            padding: 14px 16px;
+        }
+        .stat .big {
+            font-family: var(--mono); font-weight: 700; font-size: 22px;
+            color: var(--thr); font-variant-numeric: tabular-nums;
+        }
+        .stat .cap {
+            font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+            color: var(--faint); margin-top: 6px; font-family: var(--disp);
+        }
+        .stat .sub { font-size: 11px; color: var(--muted); margin-top: 3px; }
+
+        footer {
+            margin-top: 26px; color: var(--faint); font-size: 11.5px;
+            text-align: center; line-height: 1.7;
+        }
+        footer code { color: var(--muted); }
+        footer a { color: var(--thr-dim); }
+    </style>
+</head>
+<body>
+<div class="wrap">
+
+    <header>
+        <h1><span class="at">@</span>zakkster/lite-throttle</h1>
+        <div class="chips">
+            <span class="chip">peer <b>lite-signal</b></span>
+            <span class="chip">zero-gc</span>
+            <span class="chip">MIT</span>
+        </div>
+    </header>
+    <p class="sub">
+        One <b style="color:var(--raw)">noise source</b>. Three reactive consumers.
+        Compare RAW (every set) vs <b style="color:var(--thr)">throttle(ms)</b> (time-windowed) vs
+        <b style="color:var(--raf)">throttleRAF</b> (frame-aligned). Move the pointer, drag the slider, or punch the burst button.
+    </p>
+
+    <!-- ── Noise source + controls ──────────────────────────────────────── -->
+    <div class="noise">
+        <div class="card">
+            <h2>Noise source</h2>
+            <div class="pad" id="pad">
+                <div class="pad-dot" id="padDot" style="opacity:0"></div>
+                <div class="pad-readout" id="padOut">x=· y=·</div>
+            </div>
+        </div>
+        <div class="card controls">
+            <h2>Controls</h2>
+            <div class="row">
+                <span class="lbl">throttle ms</span>
+                <input id="ms" type="range" min="8" max="500" step="2" value="64"/>
+                <span class="val" id="msVal">64 ms</span>
+            </div>
+            <div class="row">
+                <span class="lbl">leading edge</span>
+                <span class="toggle"><input id="leading" type="checkbox" checked/><span class="track"></span><span class="knob"></span></span>
+            </div>
+            <div class="row">
+                <span class="lbl">trailing edge</span>
+                <span class="toggle"><input id="trailing" type="checkbox" checked/><span class="track"></span><span class="knob"></span></span>
+            </div>
+            <div class="row">
+                <span class="lbl">slider source</span>
+                <input id="slider" type="range" min="0" max="1000" value="500" style="flex:1; max-width: 220px"/>
+            </div>
+            <div class="row">
+                <span class="lbl"></span>
+                <button class="btn burst" id="burst">BURST 1000 sync writes</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Three channels ───────────────────────────────────────────────── -->
+    <div class="channels">
+        <div class="channel raw">
+            <div class="ch-label">
+                <div class="name"><span class="dot"></span>RAW</div>
+                <div class="desc">every source.set()</div>
+            </div>
+            <canvas class="ch-canvas" id="cvRaw"></canvas>
+            <div class="ch-meters">
+                <div class="ch-meter"><div class="n" id="rawN">0</div><div class="t">emissions</div></div>
+                <div class="ch-meter"><div class="n" id="rawReduce">—</div><div class="t">reduction</div></div>
+            </div>
+        </div>
+
+        <div class="channel thr">
+            <div class="ch-label">
+                <div class="name"><span class="dot"></span>throttle</div>
+                <div class="desc" id="thrDesc">ms window</div>
+            </div>
+            <canvas class="ch-canvas" id="cvThr"></canvas>
+            <div class="ch-meters">
+                <div class="ch-meter"><div class="n" id="thrN">0</div><div class="t">emissions</div></div>
+                <div class="ch-meter"><div class="n" id="thrReduce">—</div><div class="t">reduction</div></div>
+            </div>
+        </div>
+
+        <div class="channel raf">
+            <div class="ch-label">
+                <div class="name"><span class="dot"></span>throttleRAF</div>
+                <div class="desc">per animation frame</div>
+            </div>
+            <canvas class="ch-canvas" id="cvRaf"></canvas>
+            <div class="ch-meters">
+                <div class="ch-meter"><div class="n" id="rafN">0</div><div class="t">emissions</div></div>
+                <div class="ch-meter"><div class="n" id="rafReduce">—</div><div class="t">reduction</div></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Stats from real bench ────────────────────────────────────────── -->
+    <div class="stats">
+        <div class="stat">
+            <div class="big">7.7 M/s</div>
+            <div class="cap">throttle ops/sec</div>
+            <div class="sub">Node v23, bench median</div>
+        </div>
+        <div class="stat">
+            <div class="big">10.2 M/s</div>
+            <div class="cap">throttleRAF ops/sec</div>
+            <div class="sub">in-frame writes</div>
+        </div>
+        <div class="stat">
+            <div class="big">~0 B/op</div>
+            <div class="cap">hot-path alloc</div>
+            <div class="sub">-3.9 KB over 100k sets</div>
+        </div>
+        <div class="stat">
+            <div class="big">1.65×</div>
+            <div class="cap">vs naive setTimeout</div>
+            <div class="sub">2.0× vs lodash.throttle</div>
+        </div>
+    </div>
+
+    <footer>
+        Live on the real package — <code>../index.js</code> + <code>@zakkster/lite-signal</code> via import map.
+        Numbers from <code>npm run bench</code>. Adjust the toggles to flip edges live; the underlying throttle instances are torn down and rebuilt on each change.
+    </footer>
+</div>
+
+<script type="module">
+    import { signal, effect } from "@zakkster/lite-signal";
+    import { throttle, throttleRAF } from "../index.js";
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Zero-GC demo discipline
+    //
+    //  This script is the demo of a zero-GC library; it must itself walk the
+    //  walk. Hot paths (pointermove, source.set effect callbacks, the 60Hz
+    //  paintAll loop) do ZERO JS-heap allocations beyond the unavoidable
+    //  Number→String conversion at the DOM-text boundary, and even those are
+    //  dedupe-gated so identical values are not re-assigned.
+    //
+    //  What we pre-allocate at boot:
+    //    - CHANNEL_KEYS                 string[3]  iteration list (no Object.keys)
+    //    - INV_WINDOW                   number     1/WINDOW_MS for mul-by-inverse
+    //    - pulseBuffers.*               Float64Array(RING_SIZE)  power-of-2 ring
+    //    - PCT_STRINGS[0..100]          string[101]  percentage labels
+    //    - PX_STRINGS[0..300]           string[301]  pad-dot CSS px values
+    //    - cv[k].ctx / .w / .h          cached canvas context + dims
+    //    - last{Count,Reduce,Dot,Read}  per-channel scalar caches for dedupe
+    //
+    //  What hot paths do NOT do:
+    //    - Object.keys(...)             (replaced by indexed iteration over CHANNEL_KEYS)
+    //    - array.splice(0, n)           (replaced by ring-buffer overwrite + cutoff filter)
+    //    - x.toFixed(n)                 (replaced by integer truncation + lookup table)
+    //    - n + 'px' / `${n}px`          (replaced by PX_STRINGS[n] lookup)
+    //    - a / b in render loop         (replaced by a * INV_WINDOW)
+    //    - getBoundingClientRect        (cached at boot + resize)
+    //    - elem.textContent (read)      (would generate a string; cached in JS instead)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    const $ = (id) => document.getElementById(id);
+    const pad = $('pad'), padDot = $('padDot'), padOut = $('padOut');
+    const msR = $('ms'), msVal = $('msVal'), thrDesc = $('thrDesc');
+    const leadingCb = $('leading'), trailingCb = $('trailing');
+    const slider = $('slider'), burstBtn = $('burst');
+
+    // ── Pre-allocated constants ─────────────────────────────────────────
+    const RING_SIZE  = 4096;            // power of 2 -> bitmask instead of modulo
+    const RING_MASK  = RING_SIZE - 1;
+    const WINDOW_MS  = 4000;
+    const INV_WINDOW = 1 / WINDOW_MS;   // multiply by inverse instead of divide
+    const CHANNEL_KEYS = ['raw', 'thr', 'raf'];
+    const DASH_STR = '—';
+
+    // ── Pre-allocated string tables ─────────────────────────────────────
+    // PCT_STRINGS[i] === '<i>%' for i in [0..100]. Reduction lookups become
+    // PCT_STRINGS[r] with zero per-frame allocation.
+    const PCT_STRINGS = new Array(101);
+    for (let i = 0; i <= 100; i++) PCT_STRINGS[i] = i + '%';
+    // PX_STRINGS[i] === '<i>px' for i in [0..2000]. Covers the pad on any
+    // reasonable monitor (the layout caps total width at 1080px and the pad
+    // gets ~60% of that). The lookup is the zero-alloc fast path; a literal
+    // `n + 'px'` fallback handles the rare case of an oversized layout or a
+    // briefly-negative coordinate at the pad edge.
+    const PX_STRINGS = new Array(2001);
+    for (let i = 0; i <= 2000; i++) PX_STRINGS[i] = i + 'px';
+
+    // ── Pulse ring buffers (Float64Array, unboxed doubles) ──────────────
+    // Sentinel: -Infinity. The painter's cutoff is `now - WINDOW_MS`, which
+    // is NEGATIVE for the first WINDOW_MS of page lifetime (performance.now()
+    // starts near 0). The predicate `t <= cutoff` therefore does NOT skip
+    // zero-initialized slots during that window -- it treats them as live
+    // pulses at t=0 and tries to draw all 4096 × 3 = 12,288 glowing lines
+    // per frame, tanking the GPU until t reaches WINDOW_MS. -Infinity is
+    // less than any finite cutoff so empty slots are skipped from frame 1.
+    const pulseBuffers = {
+        raw: new Float64Array(RING_SIZE).fill(-Infinity),
+        thr: new Float64Array(RING_SIZE).fill(-Infinity),
+        raf: new Float64Array(RING_SIZE).fill(-Infinity),
+    };
+    const pulseHeads = { raw: 0, thr: 0, raf: 0 };
+
+    // ── Canvas + meter refs (cached, never re-resolved per frame) ───────
+    const cv = {
+        raw: { canvas: $('cvRaw'), ctx: null, w: 0, h: 0, color: '#ff5a55' },
+        thr: { canvas: $('cvThr'), ctx: null, w: 0, h: 0, color: '#34f5a3' },
+        raf: { canvas: $('cvRaf'), ctx: null, w: 0, h: 0, color: '#ffc24d' },
+    };
+    const meterN      = { raw: $('rawN'),      thr: $('thrN'),      raf: $('rafN') };
+    const meterReduce = { raw: $('rawReduce'), thr: $('thrReduce'), raf: $('rafReduce') };
+    const counts      = { raw: 0, thr: 0, raf: 0 };
+
+    // Per-element value caches: skip DOM writes when the textContent would not change.
+    const lastCount   = { raw: -1, thr: -1, raf: -1 };
+    const lastReduce  = { raw: '', thr: '', raf: '' };
+
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+    // Cached pad rect — refreshed on resize, not on every pointermove. The
+    // getBoundingClientRect() call allocates a DOMRect each time; doing it
+    // at 1000Hz under a gaming mouse was the worst offender. We also add
+    // clientLeft/clientTop so the cached origin is the pad's INNER edge
+    // (padding-box, border excluded). position:absolute on the dot positions
+    // from that inner edge too, so the dot's center now sits exactly on the
+    // cursor instead of one border-width off.
+    let padRectLeft = 0, padRectTop = 0;
+    function refreshPadRect() {
+        const r = pad.getBoundingClientRect();
+        padRectLeft = r.left + pad.clientLeft;
+        padRectTop  = r.top  + pad.clientTop;
+    }
+
+    // Pointer state — written at pointermove rate, READ at 60Hz inside paintAll.
+    let padX = 0, padY = 0;
+    let lastDotX = -1, lastDotY = -1;
+    let lastReadout = '';
+    let seq = 0;
+
+    // ── Source + throttled views ────────────────────────────────────────
+    const source = signal(0);
+    let thrApi = null, rafApi = null;
+    let thrStopWatch = null, rafStopWatch = null;
+
+    function rebuildThrottles() {
+        if (thrStopWatch) thrStopWatch();
+        if (rafStopWatch) rafStopWatch();
+        if (thrApi) thrApi.dispose();
+        if (rafApi) rafApi.dispose();
+        const ms = +msR.value;
+        const opts = { leading: leadingCb.checked, trailing: trailingCb.checked };
+        thrApi = throttle(() => source(), ms, opts);
+        rafApi = throttleRAF(() => source(), opts);
+
+        // Hot-path effect callbacks: ONLY increment a counter and write a
+        // timestamp into a pre-allocated typed array. No DOM, no template
+        // literals, no Object.keys, no function calls. The painter at 60Hz
+        // does all the visible work.
+        thrStopWatch = effect(() => {
+            thrApi();
+            counts.thr++;
+            const head = pulseHeads.thr;
+            pulseBuffers.thr[head] = performance.now();
+            pulseHeads.thr = (head + 1) & RING_MASK;
+        });
+        rafStopWatch = effect(() => {
+            rafApi();
+            counts.raf++;
+            const head = pulseHeads.raf;
+            pulseBuffers.raf[head] = performance.now();
+            pulseHeads.raf = (head + 1) & RING_MASK;
+        });
+
+        // One textContent write per option change (rare). Acceptable string alloc.
+        thrDesc.textContent = ms + 'ms · L=' + (opts.leading ? '\u2713' : '\u2717') +
+                                   ' T=' + (opts.trailing ? '\u2713' : '\u2717');
+    }
+
+    // RAW effect: never rebuilt. Same hot-path discipline as the throttled ones.
+    effect(() => {
+        source();
+        counts.raw++;
+        const head = pulseHeads.raw;
+        pulseBuffers.raw[head] = performance.now();
+        pulseHeads.raw = (head + 1) & RING_MASK;
+    });
+
+    // ── 60Hz painter: drives all DOM updates ────────────────────────────
+    function paintAll() {
+        const now    = performance.now();
+        const cutoff = now - WINDOW_MS;
+
+        // (1) Three scope strips + counters
+        for (let ci = 0; ci < CHANNEL_KEYS.length; ci++) {
+            const k = CHANNEL_KEYS[ci];
+            const c = cv[k];
+            const ctx = c.ctx;
+            const w = c.w, h = c.h;
+
+            // Clear + baseline (literal strings; no allocation, just FFI to native canvas)
+            ctx.fillStyle = '#0a1011';
+            ctx.fillRect(0, 0, w, h);
+            ctx.strokeStyle = '#13211f';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(0, h * 0.5); ctx.lineTo(w, h * 0.5); ctx.stroke();
+
+            // Pulses from ring buffer: skip slots with stale or zero timestamps.
+            const buf = pulseBuffers[k];
+            ctx.strokeStyle = c.color;
+            ctx.lineWidth = 1.5;
+            ctx.shadowColor = c.color;
+            ctx.shadowBlur = 4;
+            for (let i = 0; i < RING_SIZE; i++) {
+                const t = buf[i];
+                if (t <= cutoff) continue;        // empty slots (-Infinity) always skip; stale pulses ditto
+                const age      = now - t;
+                const ageRatio = age * INV_WINDOW;        // mul by inverse, not div
+                const x        = w - ageRatio * w;
+                const fade     = 1 - ageRatio;
+                ctx.globalAlpha = fade < 0.18 ? 0.18 : fade;
+                ctx.beginPath();
+                ctx.moveTo(x, 8); ctx.lineTo(x, h - 8); ctx.stroke();
+            }
+            ctx.globalAlpha = 1;
+            ctx.shadowBlur  = 0;
+
+            // Counter — only write the DOM when the value actually changed.
+            if (counts[k] !== lastCount[k]) {
+                // Engine does Number→String here; nursery-collected; capped to 3/frame.
+                meterN[k].textContent = counts[k];
+                lastCount[k] = counts[k];
+            }
+        }
+
+        // (2) Reduction percentages (use the PCT_STRINGS lookup, zero allocation)
+        const raw = counts.raw;
+        if (raw === 0) {
+            if (lastReduce.thr !== DASH_STR) { meterReduce.thr.textContent = DASH_STR; lastReduce.thr = DASH_STR; }
+            if (lastReduce.raf !== DASH_STR) { meterReduce.raf.textContent = DASH_STR; lastReduce.raf = DASH_STR; }
+        } else {
+            for (let i = 1; i < CHANNEL_KEYS.length; i++) {
+                const k = CHANNEL_KEYS[i];                       // skip 'raw' at index 0
+                // (100 - x) | 0 truncates to integer; clamp into [0..100].
+                let r = (100 - (counts[k] * 100 / raw)) | 0;
+                if (r < 0) r = 0;
+                else if (r > 100) r = 100;
+                const s = PCT_STRINGS[r];
+                if (lastReduce[k] !== s) { meterReduce[k].textContent = s; lastReduce[k] = s; }
+            }
+        }
+        // RAW shows the absolute source count (rare allocation; only on change)
+        if (lastCount.raw !== counts.raw) {
+            // This branch was already taken above for the counter; the reduce
+            // cell's "<n> src" still benefits from change-gating. We accept
+            // ONE template-style alloc per second-or-so of activity.
+            const rs = raw === 0 ? DASH_STR : (raw + ' src');
+            if (lastReduce.raw !== rs) { meterReduce.raw.textContent = rs; lastReduce.raw = rs; }
+        }
+
+        // (3) Pad dot + readout — driven by cached pointer state at 60Hz
+        const px = padX | 0, py = padY | 0;
+        if (px !== lastDotX || py !== lastDotY) {
+            // ALWAYS write (the bug in the previous version was a silent skip
+            // when out of table range, which left the dot frozen at its last
+            // in-range position). Lookup table is the zero-alloc fast path;
+            // string-concat fallback only fires on oversized layouts or the
+            // rare negative coord at a pad edge -- nursery-collected.
+            padDot.style.left = (px >= 0 && px < PX_STRINGS.length) ? PX_STRINGS[px] : (px + 'px');
+            padDot.style.top  = (py >= 0 && py < PX_STRINGS.length) ? PX_STRINGS[py] : (py + 'px');
+            lastDotX = px;
+            lastDotY = py;
+            // Readout text: small, dedupe-gated; one alloc per actual change at 60Hz max.
+            const r = 'x=' + px + ' y=' + py;
+            if (r !== lastReadout) { padOut.textContent = r; lastReadout = r; }
+        }
+
+        requestAnimationFrame(paintAll);
+    }
+
+    // ── Inputs (zero-alloc on hot paths) ────────────────────────────────
+    pad.addEventListener('pointermove', (e) => {
+        // No getBoundingClientRect here — padRectLeft/Top is cached on resize.
+        padX = e.clientX - padRectLeft;
+        padY = e.clientY - padRectTop;
+        pad.classList.add('active');
+        padDot.style.opacity = '1';
+        source.set(++seq);
+    });
+    pad.addEventListener('pointerleave', () => { padDot.style.opacity = '0'; });
+    slider.addEventListener('input', () => { source.set(++seq); });
+    burstBtn.addEventListener('click', () => {
+        for (let i = 0; i < 1000; i++) source.set(++seq);
+    });
+    msR.addEventListener('input', () => {
+        msVal.textContent = msR.value + ' ms';
+        rebuildThrottles();
+    });
+    leadingCb.addEventListener('change', rebuildThrottles);
+    trailingCb.addEventListener('change', rebuildThrottles);
+
+    // ── Boot ────────────────────────────────────────────────────────────
+    function fitCanvas(c) {
+        const r = c.canvas.getBoundingClientRect();
+        c.canvas.width  = r.width  * dpr;
+        c.canvas.height = r.height * dpr;
+        c.ctx = c.canvas.getContext('2d');           // cache the context
+        c.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        c.w = r.width;
+        c.h = r.height;
+    }
+    function fitAll() {
+        for (let i = 0; i < CHANNEL_KEYS.length; i++) fitCanvas(cv[CHANNEL_KEYS[i]]);
+        refreshPadRect();
+    }
+    fitAll();
+    window.addEventListener('resize', fitAll);
+
+    rebuildThrottles();
+    // The initial subscribe fires (RAW effect + thr effect + raf effect each
+    // run once on creation, per lite-signal's effect contract) wrote three
+    // performance.now() timestamps -- one per channel -- into the ring buffers
+    // and bumped each counter to 1. Reset both. The buffers use -Infinity as
+    // the empty sentinel so the painter's `t <= cutoff` predicate skips empty
+    // slots from frame 1, even when `cutoff` is negative (page age < WINDOW_MS).
+    counts.raw = counts.thr = counts.raf = 0;
+    pulseBuffers.raw.fill(-Infinity);
+    pulseBuffers.thr.fill(-Infinity);
+    pulseBuffers.raf.fill(-Infinity);
+    pulseHeads.raw = pulseHeads.thr = pulseHeads.raf = 0;
+    requestAnimationFrame(paintAll);
+</script>
+</body>
+</html>

@@ -1,0 +1,203 @@
+# @zakkster/lite-throttle
+
+> Zero-GC reactive throttle built on `@zakkster/lite-signal`. Timer-based and
+> requestAnimationFrame-aligned variants, intent-guarded writes, synchronous
+> leading emit. Per source change in steady state: zero JS-heap allocations
+> from this package. Clock is read only at potential leading edges, not on
+> every write. ESM-only, MIT licensed, ~1 KB min+gz.
+
+Two exports, both build on lite-signal's `signal` / `effect` / `untrack` /
+`onCleanup`. Both return a read-only callable api (`() => T` with `.peek`,
+`.subscribe`, `.dispose`, `.cancel`, `.flush`, and `.pending`). Trailing fire
+respects re-entrant writes from subscribers (the flush snapshots and clears
+`pendingValue` before `out.set`).
+
+## Core API
+
+- **`throttle(sourceFn, ms, { leading = true, trailing = true, now, schedule, cancel })`**
+  Leading and/or trailing throttle. First non-equal change emits immediately;
+  subsequent in-window changes coalesce into one trailing fire at lockout
+  expiry. `ms` accepts a number OR a `() => number` (dynamic window, read via
+  untrack). `ms` is required.
+- **`throttleRAF(sourceFn, { leading = true, trailing = true, raf, caf })`**
+  Leading and/or trailing throttle aligned to the host's animation frame.
+  Same shape; the lockout window is one frame. Throws at construction if no
+  rAF is available and none was injected.
+- **edges (1.1)**: `{ leading: false }` fires only the latest value per window
+  (trailing-only); `{ trailing: false }` fires the leading edge and drops the
+  rest; both false emits nothing (degenerate).
+- **`.cancel()` / `.flush()`** (1.1, both apis): `cancel()` drops the pending
+  trailing emission (output unchanged, instance stays usable); `flush()` emits
+  the pending value now and returns the current output (no-op if none pending).
+- **`.pending()`** (1.2, both apis): boolean, true iff a trailing emission is
+  currently queued. Cheap; safe to poll.
+- **Dependency injection** (1.2): `throttle` accepts `now`, `schedule`,
+  `cancel` for a custom clock/scheduler. `throttleRAF` accepts `raf`, `caf`.
+  Enables headless tests without global monkey-patching and custom time
+  domains (game engines, playback).
+
+## Architecture invariants
+
+- **Skip clock during lockout**: once the lockout timer (or rAF) is armed,
+  further writes don't read the clock -- they just queue `pendingValue`. The
+  realistic hot path during a burst. `now()` is only called at potential
+  leading edges (when `timerId === null` / `rafId === null`).
+- **Snapshot-before-set in flush**: `pendingValue` is snapshotted into a local
+  and cleared BEFORE `out.set`, because `out.set` is synchronous and a
+  subscriber that writes back to the source re-enters the effect during emit.
+  Clearing after would wipe the re-entrant write.
+- **Intent guard**: `Object.is(next, hasPending ? pendingValue : out.peek())`
+  short-circuits no-op writes. `NaN` is its own match.
+- **Equality-passthrough on output**: the internal signal uses lite-signal's
+  default `Object.is` equality. A trailing/leading fire whose value matches
+  the current output does not notify subscribers.
+- **`api.dispose()` is the disposal contract**: the api is a callable, so
+  `lite-signal.dispose(api)` would invoke it under the effect-handle contract
+  rather than tearing down. Always call `api.dispose()`.
+- **Ownership cascade cleanup (1.2)**: a synchronous `onCleanup(...)` call
+  at the end of each constructor attaches to the caller's `currentOwner`
+  (the enclosing effect/computed at construction time). When that owner
+  re-runs or disposes, the attached cleanup cancels the pending
+  `setTimeout` / `rAF` after the source-reading effect has been
+  cascade-disposed. Before 1.2, cascade dispose released the reactive
+  graph but left the timer armed to fire against a torn-down downstream.
+  At top level (no enclosing owner) the `onCleanup` is a no-op; only
+  `api.dispose()` cleans up, matching the pre-1.2 contract.
+- **Dynamic ms is untracked (1.2)**: when `ms` is `() => number`, the reader
+  is called via `untrack` at each potential-leading branch. The window is
+  configuration, not a value dependency; consumers who want reactive reconfig
+  do it explicitly.
+- **throttleRAF double-emit on re-entrant write**: if a subscriber writes
+  back to the source during a trailing fire, `rafId === null` again and the
+  re-queued effect run takes the leading-edge branch -- emitting the new value
+  and arming a new rAF. The consumer can see two emissions in one tick.
+  Correct; worth knowing for feedback loops.
+
+## Performance characteristics
+
+- `throttle(src, ms).set` per change inside lockout: O(1), zero JS-heap alloc,
+  zero clock reads, zero window reads. Pure state mutation.
+- `throttle` per change with `timerId === null` (rare, post-lockout or fresh):
+  one `now()` read, one `readMs()` read, optional `schedule()` arm.
+- `throttleRAF.set` per change inside frame: O(1), zero alloc, zero clock
+  reads, zero rAF churn. The tightest hot path in either package.
+- Per trailing fire: one out.set propagation through lite-signal (O(downstream
+  observers), zero alloc per lite-signal's pool contract).
+- Construction: one signal node, one effect node, links, closures.
+  Unchanged from 1.1 -- the 1.2 cascade fix is a single onCleanup
+  registration that attaches to the caller's owner scope, no extra
+  effect node.
+
+## When to use
+
+- Pointer / scroll / resize event sources at the host's frame rate
+  (`throttleRAF`).
+- Capping any signal update at a fixed-ms cadence regardless of frame timing
+  (`throttle`).
+- Driving canvas/WebGL render from a chaotic input signal (`throttleRAF`).
+- Background-tab safety: use `throttle(src, 16)` over `throttleRAF` when you
+  need updates to continue when the tab is backgrounded.
+- Headless / worker / SSR contexts (1.2): inject `{ raf, caf }` on
+  `throttleRAF`, or use `throttle` with a custom `now` / `schedule`.
+
+## When NOT to use
+
+- You want to fire only after the burst ends, not during. Use
+  `@zakkster/lite-debounce` instead.
+- You want emit-on-every-fire regardless of value equality. The output is
+  Object.is-deduped; project to a tuple or attach a write-token.
+- You're rendering and need vsync alignment but can't tolerate
+  background-tab pause. Use `throttle(src, 16)`.
+
+## API summary
+
+```ts
+interface ReadonlyDerived<T> {
+    (): T;                                          // tracked read
+    peek(): T;                                      // untracked read
+    subscribe(fn: (value: T) => void): () => void;  // returns unsubscribe
+    dispose(): void;                                // cancel + release
+    cancel(): void;                                 // 1.1: drop pending trailing emission
+    flush(): T;                                     // 1.1: emit pending value now
+    pending(): boolean;                             // 1.2: true iff trailing queued
+}
+
+interface ThrottleOptions {
+    leading?: boolean;                              // 1.1
+    trailing?: boolean;                             // 1.1
+    now?: () => number;                             // 1.2, default performance.now
+    schedule?: (fn: () => void, ms: number) => unknown;   // 1.2, default setTimeout
+    cancel?: (id: unknown) => void;                 // 1.2, default clearTimeout
+}
+interface ThrottleRAFOptions {
+    leading?: boolean;                              // 1.1
+    trailing?: boolean;                             // 1.1
+    raf?: (cb: () => void) => unknown;              // 1.2, default globalThis.requestAnimationFrame
+    caf?: (id: unknown) => void;                    // 1.2, default globalThis.cancelAnimationFrame
+}
+function throttle<T>(
+    sourceFn: () => T,
+    ms: number | (() => number),                    // 1.2: dynamic window
+    options?: ThrottleOptions,
+): ReadonlyDerived<T>;
+function throttleRAF<T>(sourceFn: () => T, options?: ThrottleRAFOptions): ReadonlyDerived<T>;
+```
+
+## Idioms
+
+```js
+// Cursor render at vsync
+const pointer = signal({ x: 0, y: 0 });
+const framed = throttleRAF(() => pointer());
+effect(() => drawCursor(framed()));
+
+// Resize cap at ~60Hz
+const viewport = signal({ w: 0, h: 0 });
+const r = throttle(() => viewport(), 16);
+r.subscribe(({ w, h }) => relayout(w, h));
+
+// Scroll-driven progress bar
+const scrollY = signal(0);
+const perFrame = throttleRAF(() => scrollY());
+effect(() => hud.setProgress(perFrame() / pageHeight));
+```
+
+## File layout
+
+- `Throttle.js`             -- timer-based, full JSDoc.
+- `ThrottleRAF.js`          -- rAF-aligned, full JSDoc.
+- `_shared.js`              -- internal `makeReadonlyApi` helper, not re-exported.
+- `index.js`                -- barrel re-export of `throttle` and `throttleRAF`.
+- `index.d.ts`              -- TypeScript declarations.
+- `test/01-edges-and-control.test.js`     -- 9 tests: leading/trailing combos
+  + cancel/flush across both engines.
+- `test/02-raf-corner-cases.test.js`      -- 9 tests: no-trailing-without-
+  change, intent-guard short-circuit, NaN dedupe, dispose-mid-frame,
+  re-entrant write on leading edge, re-entrant write during trailing fire
+  (the documented "two emits in one tick" feedback-loop quirk).
+- `test/03-timer-corner-cases.test.js`    -- 10 tests: same-value writes
+  short-circuited (output- and pending-equal), lockout-fully-expired path,
+  dispose idempotency, cancel/flush no-pending safety, subscribe semantics,
+  peek vs tracked read.
+- `test/04-degenerate-and-runtime.test.js` -- 9 tests: both-edges-disabled
+  emits nothing, trailing-disabled drops with no late catch-up, leading-
+  disabled first write opens the trailing window, api shape across engines.
+- `test/zero-gc.test.js`                  -- 3 hot-path retention budgets
+  (auto-skip without --expose-gc) + 2 structural twin tests (10k writes ->
+  exactly leading + trailing, both engines).
+- Driver: lockstep fake `performance.now()` + node:test mock timers for the
+  timer engine, fake-rAF queue for the RAF engine. No real rAF in CI.
+- `bench/benchmark.mjs`     -- comparative bench vs naive vs lodash, 5-round median.
+
+## Install
+
+```bash
+npm install @zakkster/lite-throttle @zakkster/lite-signal
+```
+
+`@zakkster/lite-signal` is a peer dependency; the consumer's lite-signal
+instance is reused (no duplicate reactive registries).
+
+## License
+
+MIT (c) Zahary Shinikchiev
